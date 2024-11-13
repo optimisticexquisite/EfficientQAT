@@ -59,10 +59,10 @@ def get_c4(tokenizer, train_size, val_size, seed, seqlen, test_only):
                     )
     except:
         traindata = load_dataset(
-            'allenai/c4', 'allenai--c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
+            'allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
         )
         valdata = load_dataset(
-            'allenai/c4', 'allenai--c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
+            'allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
         )
 
     random.seed(0)
@@ -170,8 +170,38 @@ def get_loaders(
 
 
 @torch.no_grad()
-def test_ppl(model, tokenizer, datasets=['wikitext2'],ppl_seqlen=2048):
+def test_ppl(model, tokenizer, datasets=['wikitext2'], ppl_seqlen=1):
     results = {}
+    layer_names = [
+        "model.layers.28.self_attn.q_proj",
+        "model.layers.28.self_attn.k_proj",
+        "model.layers.28.self_attn.v_proj",
+        "model.layers.28.self_attn.o_proj",
+        "model.layers.28.mlp.gate_proj",
+        "model.layers.28.mlp.up_proj",
+        "model.layers.28.mlp.down_proj",
+        "model.layers.28.input_layernorm"
+    ]
+
+    # This dictionary will hold the inputs and outputs for each layer
+    layer_io = {name: {"inputs": [], "outputs": []} for name in layer_names}
+    # Define a hook function that appends each batch's input/output to layer_io
+    def get_hook(layer_name):
+        def hook(module, input, output):
+            layer_io[layer_name]["inputs"].append(input[0].detach().cpu())
+            layer_io[layer_name]["outputs"].append(output.detach().cpu())
+            # print(f"Appending input/output to {layer_name}")
+        return hook
+
+    # Attach hooks to specified layers
+    handles = []
+    for name, module in model.named_modules():
+        if name in layer_names:
+            handle = module.register_forward_hook(get_hook(name))
+            handles.append(handle)
+            # print(f"Hook attached to {name}")
+
+    # Process each dataset in the evaluation function
     for dataset in datasets:
         testloader = get_loaders(
             dataset,
@@ -180,10 +210,8 @@ def test_ppl(model, tokenizer, datasets=['wikitext2'],ppl_seqlen=2048):
             seqlen=ppl_seqlen,
             test_only=True
         )
-        if "c4" in dataset:
-            testenc = testloader
-        else:
-            testenc = testloader.input_ids
+        
+        testenc = testloader.input_ids if "c4" not in dataset else testloader
 
         seqlen = ppl_seqlen
         nsamples = testenc.numel() // seqlen
@@ -191,42 +219,55 @@ def test_ppl(model, tokenizer, datasets=['wikitext2'],ppl_seqlen=2048):
         model.config.use_cache = False
         model.eval()
         nlls = []
-        if hasattr(model,'lm_head') and isinstance(model.lm_head, nn.Linear):
+
+        # Identify classifier layer if present
+        if hasattr(model, 'lm_head') and isinstance(model.lm_head, nn.Linear):
             classifier = model.lm_head
-        elif hasattr(model.model,'lm_head'):
-            # for gptqmodels
-            classifier = None
-        elif hasattr(model,'output'):
-            # for internlm
-            classifier = model.output
+        elif hasattr(model.model, 'lm_head'):
+            classifier = None  # For models with gptq structure
+        elif hasattr(model, 'output'):
+            classifier = model.output  # For internlm structure
         else:
             raise NotImplementedError
+
+        # Loop over each sample (batch) and record I/O
+        # print(f"nsamples: {nsamples}")
         for i in tqdm(range(nsamples)):
-            batch = testenc[:, (i * seqlen) : ((i + 1) * seqlen)].to(model.device)
+            batch = testenc[:, (i * seqlen): ((i + 1) * seqlen)].to(model.device)
             outputs = model.model(batch)
+            
+            # Get logits from the classifier if it exists
             if classifier is not None:
                 hidden_states = outputs[0]
                 logits = classifier(hidden_states.to(classifier.weight.dtype))
             else:
                 logits = outputs[0]
+
+            # Calculate loss and negative log-likelihood
             shift_logits = logits[:, :-1, :]
-            shift_labels = testenc[:, (i * seqlen) : ((i + 1) * seqlen)][
-                :, 1:
-            ].to(shift_logits.device)
+            shift_labels = testenc[:, (i * seqlen): ((i + 1) * seqlen)][:, 1:].to(shift_logits.device)
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-            )
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             neg_log_likelihood = loss.float() * seqlen
             nlls.append(neg_log_likelihood)
 
-
+        # Calculate perplexity
         ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * seqlen))
         print(f'{dataset}:{ppl}')
         results[dataset] = ppl.item()
+
+        # Save captured input/output tensors for each batch
+        torch.save(layer_io, f"./layer_io_{dataset}.pth")
+        print(f"Layer I/O for {dataset} saved to ./layer_io_{dataset}.pth")
+
+    # Detach hooks to avoid memory leaks
+    for handle in handles:
+        handle.remove()
+
+    # Restore model config cache
     model.config.use_cache = use_cache
     return results
+
 
 class BlockTrainDataset(Dataset):
     def __init__(self, size, seqlen, hidden_size, batch_size, dtype, cache_path='./cache/block_training_data', off_load_to_disk=False):

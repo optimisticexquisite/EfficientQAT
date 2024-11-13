@@ -2,14 +2,25 @@ import builtins
 import math
 import time
 from typing import Dict
-
 import triton
 
-
-#  code based https://github.com/fpgaminer/GPTQ-triton
-"""
-Mostly the same as the autotuner in Triton, but with a few changes like using 40 runs instead of 100.
-"""
+# Replace the benchmark function with a custom benchmark
+def custom_benchmark(kernel_call, rep=40):
+    import torch
+    times = []
+    for _ in range(rep):
+        torch.cuda.synchronize()
+        start = time.time()
+        kernel_call()
+        torch.cuda.synchronize()
+        end = time.time()
+        times.append(end - start)
+    # Calculate quantiles similar to triton.testing.do_bench
+    times.sort()
+    median = times[rep // 2]
+    lower_q = times[int(rep * 0.2)]
+    upper_q = times[int(rep * 0.8)]
+    return median, lower_q, upper_q
 
 
 class CustomizedTritonAutoTuner(triton.KernelInterface):
@@ -30,7 +41,7 @@ class CustomizedTritonAutoTuner(triton.KernelInterface):
         self.key_idx = [arg_names.index(k) for k in key]
         self.nearest_power_of_two = nearest_power_of_two
         self.cache = {}
-        # hook to reset all required tensor to zeros before relaunching a kernel
+        # Hook to reset required tensors to zeros before relaunching a kernel
         self.hook = lambda args: 0
         if reset_to_zero is not None:
             self.reset_idx = [arg_names.index(k) for k in reset_to_zero]
@@ -41,7 +52,7 @@ class CustomizedTritonAutoTuner(triton.KernelInterface):
 
             self.hook = _hook
         self.arg_names = arg_names
-        # prune configs
+        # Prune configs
         if prune_configs_by:
             perf_model, top_k = prune_configs_by['perf_model'], prune_configs_by['top_k']
             if 'early_config_prune' in prune_configs_by:
@@ -53,13 +64,9 @@ class CustomizedTritonAutoTuner(triton.KernelInterface):
         self.fn = fn
 
     def _bench(self, *args, config, **meta):
-        # check for conflicts, i.e. meta-parameters both provided
-        # as kwargs and by the autotuner
         conflicts = meta.keys() & config.kwargs.keys()
         if conflicts:
-            raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}."
-                             " Make sure that you don't re-define auto-tuned symbols.")
-        # augment meta-parameters with tunable ones
+            raise ValueError(f"Conflicting meta-parameters: {', '.join(conflicts)}.")
         current = dict(meta, **config.kwargs)
 
         def kernel_call():
@@ -69,25 +76,19 @@ class CustomizedTritonAutoTuner(triton.KernelInterface):
             self.fn.run(*args, num_warps=config.num_warps, num_stages=config.num_stages, **current)
 
         try:
-            # In testings using only 40 reps seems to be close enough and it appears to be what PyTorch uses
-            # PyTorch also sets fast_flush to True, but I didn't see any speedup so I'll leave the default
-            return triton.testing.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8), rep=40)
+            # Use custom benchmarking function
+            return custom_benchmark(kernel_call, rep=40)
         except triton.OutOfResources:
-        # except triton.OutOfResources:
             return (float('inf'), float('inf'), float('inf'))
 
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))
         if len(self.configs) > 1:
             key = tuple(args[i] for i in self.key_idx)
-
-            # This reduces the amount of autotuning by rounding the keys to the nearest power of two
-            # In my testing this gives decent results, and greatly reduces the amount of tuning required
             if self.nearest_power_of_two:
                 key = tuple([2 ** int(math.log2(x) + 0.5) for x in key])
 
             if key not in self.cache:
-                # prune configs
                 pruned_configs = self.prune_configs(kwargs)
                 bench_start = time.time()
                 timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
@@ -137,28 +138,21 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, nearest_po
         return CustomizedTritonAutoTuner(
             fn, fn.arg_names, configs, key, reset_to_zero, prune_configs_by, nearest_power_of_two
         )
-
     return decorator
 
 
 def matmul248_kernel_config_pruner(configs, nargs):
-    """
-    The main purpose of this function is to shrink BLOCK_SIZE_* when the corresponding dimension is smaller.
-    """
     m = max(2 ** int(math.ceil(math.log2(nargs['M']))), 16)
     n = max(2 ** int(math.ceil(math.log2(nargs['N']))), 16)
     k = max(2 ** int(math.ceil(math.log2(nargs['K']))), 16)
-
     used = set()
     for config in configs:
         block_size_m = min(m, config.kwargs['BLOCK_SIZE_M'])
         block_size_n = min(n, config.kwargs['BLOCK_SIZE_N'])
         block_size_k = min(k, config.kwargs['BLOCK_SIZE_K'])
         group_size_m = config.kwargs['GROUP_SIZE_M']
-
         if (block_size_m, block_size_n, block_size_k, group_size_m, config.num_stages, config.num_warps) in used:
             continue
-
         used.add((block_size_m, block_size_n, block_size_k, group_size_m, config.num_stages, config.num_warps))
         yield triton.Config(
             {
@@ -170,22 +164,17 @@ def matmul248_kernel_config_pruner(configs, nargs):
             num_stages=config.num_stages,
             num_warps=config.num_warps
         )
-        
+
+
 def hadamard248_kernel_config_pruner(configs, nargs):
-    """
-    The main purpose of this function is to shrink BLOCK_SIZE_* when the corresponding dimension is smaller.
-    """
     m = max(2 ** int(math.ceil(math.log2(nargs['M']))), 16)
     n = max(2 ** int(math.ceil(math.log2(nargs['N']))), 16)
-
     used = set()
     for config in configs:
         block_size_m = min(m, config.kwargs['BLOCK_SIZE_M'])
         block_size_n = min(n, config.kwargs['BLOCK_SIZE_N'])
-
         if (block_size_m, block_size_n , config.num_stages, config.num_warps) in used:
             continue
-
         used.add((block_size_m, block_size_n, config.num_stages, config.num_warps))
         yield triton.Config(
             {
@@ -195,6 +184,5 @@ def hadamard248_kernel_config_pruner(configs, nargs):
             num_stages=config.num_stages,
             num_warps=config.num_warps
         )
-
 
 __all__ = ["autotune"]
